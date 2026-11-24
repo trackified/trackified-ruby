@@ -72,6 +72,13 @@ module Trackified
       # @return [Carrier]
       def get(id) = Carrier.new(req(:get, "/v1/carriers/#{esc(id)}"))
 
+      # Maps free text ("USPS Priority Mail", "dhl_express", "Correos de España") to a carrier we serve.
+      # @return [CarrierResolution, nil] nil when nothing we serve matches
+      def resolve(name)
+        res = req(:get, "/v1/carriers/resolve", query: { name: name })
+        res && res["carrier"] ? CarrierResolution.new(res) : nil
+      end
+
       # @return [Array<CarrierCandidate>] most likely first
       def detect(tracking_number)
         res = req(:get, "/v1/carriers/detect", query: { number: tracking_number })
@@ -105,12 +112,37 @@ module Trackified
         nil
       end
 
+      # Changes url, event_types or enabled (at least one). The secret is unchanged.
+      # @return [Webhook]
+      def update(id, url: nil, event_types: nil, enabled: nil)
+        body = { url: url, event_types: event_types, enabled: enabled }.compact
+        raise ArgumentError, "update needs url:, event_types: or enabled:" if body.empty?
+
+        Webhook.new(req(:patch, "/v1/webhooks/#{esc(id)}", body: body))
+      end
+
+      # Issues a new secret. Until previous_secret_expires_at, deliveries are signed with both.
+      # @param expires_in_hours [Integer, nil] 0..168, default 24 on the server; 0 drops the old secret at once
+      # @return [Webhook] includes #secret (only shown once) and #previous_secret_expires_at
+      def rotate_secret(id, expires_in_hours: nil)
+        Webhook.new(req(:post, "/v1/webhooks/#{esc(id)}/rotate-secret",
+                        body: { expires_in_hours: expires_in_hours }.compact))
+      end
+
       # Sends a signed sample event. @return [Hash] {"signature", "body"}
       def test(id) = req(:post, "/v1/webhooks/#{esc(id)}/test")
+
+      # @see Trackified::Webhook.tracking_of
+      def tracking_of(event) = Webhook.tracking_of(event)
 
       # @see Trackified::WebhookSignature.verify
       def verify(raw_body, header, secret, tolerance: WebhookSignature::DEFAULT_TOLERANCE)
         WebhookSignature.verify(raw_body, header, secret, tolerance: tolerance)
+      end
+
+      # @see Trackified::WebhookSignature.verify_detailed
+      def verify_detailed(raw_body, header, secret, tolerance: WebhookSignature::DEFAULT_TOLERANCE)
+        WebhookSignature.verify_detailed(raw_body, header, secret, tolerance: tolerance)
       end
 
       # @see Trackified::WebhookSignature.construct_event
@@ -147,7 +179,7 @@ module Trackified
       end
     end
 
-    # /v1/account/usage
+    # /v1/account/usage (the canonical path; /v1/usage is an alias)
     class Usage < Base
       # @return [Trackified::Usage]
       def get = Trackified::Usage.new(req(:get, "/v1/account/usage"))

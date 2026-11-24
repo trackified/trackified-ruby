@@ -63,7 +63,8 @@ RSpec.describe Trackified::Client do
 
   {
     400 => Trackified::ValidationError, 422 => Trackified::ValidationError, 401 => Trackified::AuthenticationError,
-    403 => Trackified::PermissionError, 404 => Trackified::NotFoundError, 409 => Trackified::APIError
+    402 => Trackified::QuotaExceededError, 403 => Trackified::PermissionError, 404 => Trackified::NotFoundError,
+    409 => Trackified::ConflictError, 418 => Trackified::APIError
   }.each do |status, klass|
     it "maps #{status} to #{klass} without retrying" do
       stub = stub_request(:get, "#{base}/v1/trackings/x").to_return(status: status, body: err("c#{status}", "m"))
@@ -131,5 +132,97 @@ RSpec.describe Trackified::Client do
     expect(client.api_keys.create(name: "ci", mode: "test").token).to eq("tk_test_new")
     expect(client.api_keys.list.data.first).to be_a(Trackified::ApiKey)
     expect(client.api_keys.revoke("key_1")).to be_nil
+  end
+
+  ["https://api.test", "https://api.test/", "https://api.test/v1", "https://api.test/v1/"].each do |url|
+    it "normalises base url #{url}" do
+      c = described_class.new(api_key: "k", base_url: url)
+      expect(c.base_url).to eq("https://api.test")
+      stub = stub_request(:get, "https://api.test/v1/account/usage").to_return(body: "{}")
+      c.usage.get
+      expect(stub).to have_been_requested
+    end
+  end
+
+  it "checks health" do
+    stub_request(:get, "#{base}/v1/health").to_return(body: { status: "ok" }.to_json)
+    expect(client.health).to eq("status" => "ok")
+  end
+
+  it "keeps 402 and 409 as APIError subclasses and does not retry 409" do
+    stub = stub_request(:post, "#{base}/v1/trackings").to_return(status: 409, body: err("idempotency_in_progress"))
+    expect { client.trackings.create(tracking_number: "1") }
+      .to raise_error(Trackified::APIError) { |e| expect(e).to be_a(Trackified::ConflictError) }
+    expect(stub).to have_been_requested.once
+    expect(Trackified::QuotaExceededError.ancestors).to include(Trackified::APIError, Trackified::TrackifiedError)
+  end
+
+  it "sets ConnectionError#code to timeout or connection" do
+    c = described_class.new(api_key: "k", base_url: base, max_retries: 0)
+    stub_request(:get, "#{base}/v1/health").to_timeout
+    expect { c.health }.to raise_error(Trackified::ConnectionError) { |e| expect(e.code).to eq("timeout") }
+    stub_request(:get, "#{base}/v1/health").to_raise(Errno::ECONNREFUSED)
+    expect { c.health }.to raise_error(Trackified::ConnectionError) { |e| expect(e.code).to eq("connection") }
+  end
+
+  it "resolves carriers, nil when unknown" do
+    stub_request(:get, "#{base}/v1/carriers/resolve?name=USPS%20Priority%20Mail")
+      .to_return(body: { carrier: "usps", name: "USPS", confidence: 0.97, matched: "alias" }.to_json)
+    stub_request(:get, "#{base}/v1/carriers/resolve?name=nope").to_return(body: { carrier: nil, confidence: 0 }.to_json)
+    r = client.carriers.resolve("USPS Priority Mail")
+    expect([r.carrier, r.name, r.confidence, r.matched]).to eq(["usps", "USPS", 0.97, "alias"])
+    expect(client.carriers.resolve("nope")).to be_nil
+  end
+
+  it "reads carrier aliases and display_name in either spelling" do
+    expect(Trackified::Carrier.new("display_name" => "UPS", "aliases" => ["ups_ground"]).aliases).to eq(["ups_ground"])
+    expect(Trackified::Carrier.new("display_name" => "UPS").display_name).to eq("UPS")
+    expect(Trackified::Carrier.new("displayName" => "UPS").display_name).to eq("UPS")
+  end
+
+  it "updates a webhook and rotates its secret" do
+    wh = { id: "wh_1", url: "https://x.test", enabled: false }
+    stub_request(:patch, "#{base}/v1/webhooks/wh_1").with(body: { enabled: false }.to_json)
+                                                    .to_return(body: wh.to_json)
+    stub_request(:post, "#{base}/v1/webhooks/wh_1/rotate-secret").with(body: { expires_in_hours: 0 }.to_json)
+                                                                 .to_return(body: wh.merge(secret: "whsec_new", previous_secret_expires_at: nil).to_json)
+    expect(client.webhooks.update("wh_1", enabled: false).enabled).to be false
+    expect { client.webhooks.update("wh_1") }.to raise_error(ArgumentError)
+    rotated = client.webhooks.rotate_secret("wh_1", expires_in_hours: 0)
+    expect([rotated.secret, rotated.previous_secret_expires_at]).to eq(["whsec_new", nil])
+  end
+
+  it "calls hooks once per attempt and ignores hooks that raise" do
+    seen = []
+    c = described_class.new(api_key: "k", base_url: base, max_retries: 1,
+                            on_request: lambda { |i|
+                              seen << [:req, i]
+                              raise "boom"
+                            },
+                            on_response: lambda { |i|
+                              seen << [:res, i]
+                              raise "boom"
+                            })
+    allow(c).to receive(:sleep)
+    stub_request(:post, "#{base}/v1/trackings")
+      .to_return({ status: 503, body: err("unavailable"), headers: { "x-request-id" => "req_a" } },
+                 { status: 201, body: tracking.to_json,
+                   headers: { "x-request-id" => "req_b", "idempotent-replayed" => "true" } })
+    expect(c.trackings.create(tracking_number: "9434", idempotency_key: "k1").id).to eq("trk_1")
+    expect(seen.map(&:first)).to eq(%i[req res req res])
+    expect(seen[0][1]).to eq(method: "POST", url: "#{base}/v1/trackings", attempt: 1, idempotency_key: "k1")
+    first = seen[1][1]
+    expect([first[:status], first[:request_id], first[:error].class]).to eq([503, "req_a", Trackified::APIError])
+    last = seen[3][1]
+    expect(last).to include(attempt: 2, status: 201, request_id: "req_b", idempotent_replayed: true, error: nil)
+    expect(last[:duration_ms]).to be_a(Integer)
+  end
+
+  it "passes a ConnectionError to on_response when the connection fails" do
+    errors = []
+    c = described_class.new(api_key: "k", base_url: base, max_retries: 0, on_response: ->(i) { errors << i[:error] })
+    stub_request(:get, "#{base}/v1/health").to_timeout
+    expect { c.health }.to raise_error(Trackified::ConnectionError)
+    expect(errors.map(&:code)).to eq(["timeout"])
   end
 end

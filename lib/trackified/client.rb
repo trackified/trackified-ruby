@@ -27,13 +27,22 @@ module Trackified
     # @param base_url [String, nil] falls back to ENV["TRACKIFIED_BASE_URL"], then the production API
     # @param timeout [Numeric] seconds, per attempt
     # @param max_retries [Integer] retries after the first attempt
-    def initialize(api_key: nil, base_url: nil, timeout: 30, max_retries: 2)
+    # @param on_request [#call, nil] called before each attempt with
+    #   {method:, url:, attempt:, idempotency_key:}
+    # @param on_response [#call, nil] called after each attempt with
+    #   {method:, url:, attempt:, status:, request_id:, idempotent_replayed:, duration_ms:, error:}
+    #   (status is nil and error a ConnectionError when the connection failed). Exceptions from hooks are ignored.
+    def initialize(api_key: nil, base_url: nil, timeout: 30, max_retries: 2, on_request: nil, on_response: nil)
       @api_key = api_key || ENV.fetch("TRACKIFIED_API_KEY", nil)
       if @api_key.nil? || @api_key.empty?
         raise AuthenticationError, "No API key. Pass api_key: or set TRACKIFIED_API_KEY."
       end
 
-      @base_url = (base_url || ENV.fetch("TRACKIFIED_BASE_URL", nil) || DEFAULT_BASE_URL).chomp("/")
+      # Accept the host with or without /v1; paths below already start with /v1.
+      url = base_url || ENV.fetch("TRACKIFIED_BASE_URL", nil) || DEFAULT_BASE_URL
+      @base_url = url.chomp("/").delete_suffix("/v1")
+      @on_request = on_request
+      @on_response = on_response
       @timeout = timeout
       @max_retries = max_retries
       @trackings = Resources::Trackings.new(self)
@@ -46,6 +55,10 @@ module Trackified
 
     def inspect = "#<Trackified::Client base_url=#{@base_url.inspect}>"
 
+    # GET /v1/health (no auth needed). Raises APIError when the API answers 503 degraded.
+    # @return [Hash] {"status" => "ok"}
+    def health = request(:get, "/v1/health")
+
     # Sends a request and returns the parsed JSON body (nil when empty).
     # @api private
     def request(method, path, query: nil, body: nil, idempotency_key: nil)
@@ -54,20 +67,30 @@ module Trackified
       uri.query = URI.encode_www_form(query) if query && !query.empty?
       idempotency_key ||= SecureRandom.uuid if method == :post && body
       attempt = 0
+      verb = method.to_s.upcase
       loop do
+        info = { method: verb, url: uri.to_s, attempt: attempt + 1 }
+        hook(@on_request, **info, idempotency_key: idempotency_key)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
           res = perform(method, uri, body, idempotency_key)
         rescue *NETWORK_ERRORS => e
-          raise ConnectionError, "#{e.class}: #{e.message}" if attempt >= @max_retries
+          code = e.is_a?(Timeout::Error) ? "timeout" : "connection"
+          err = ConnectionError.new("#{e.class}: #{e.message}", code: code)
+          hook(@on_response, **info, status: nil, request_id: nil, idempotent_replayed: false,
+                                     duration_ms: elapsed_ms(started), error: err)
+          raise err if attempt >= @max_retries
 
           sleep(backoff(attempt, nil))
           attempt += 1
           next
         end
         status = res.code.to_i
-        return parse(res.body) if status < 300
-
-        err = build_error(status, res)
+        err = status < 300 ? nil : build_error(status, res)
+        hook(@on_response, **info, status: status, request_id: res["x-request-id"],
+                                   idempotent_replayed: res["idempotent-replayed"] == "true",
+                                   duration_ms: elapsed_ms(started), error: err)
+        return parse(res.body) unless err
         raise err unless retryable?(status) && attempt < @max_retries
 
         sleep(backoff(attempt, err.is_a?(RateLimitError) ? err.retry_after : nil))
@@ -76,6 +99,15 @@ module Trackified
     end
 
     private
+
+    # A hook must never break the request.
+    def hook(callable, **info)
+      callable&.call(info)
+    rescue StandardError
+      nil
+    end
+
+    def elapsed_ms(started) = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
 
     def perform(method, uri, body, idempotency_key)
       req = Net::HTTPGenericRequest.new(method.to_s.upcase, !body.nil?, true, uri.request_uri)
@@ -116,8 +148,10 @@ module Trackified
       case status
       when 400, 422 then ValidationError.new(msg, **opts)
       when 401 then AuthenticationError.new(msg, **opts)
+      when 402 then QuotaExceededError.new(msg, **opts)
       when 403 then PermissionError.new(msg, **opts)
       when 404 then NotFoundError.new(msg, **opts)
+      when 409 then ConflictError.new(msg, **opts)
       when 429
         ra = res["retry-after"]
         RateLimitError.new(msg, retry_after: ra && Float(ra, exception: false), **opts)

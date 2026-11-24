@@ -17,8 +17,13 @@ module Trackified
     def initialize: (?String? message, ?retry_after: Float?, **untyped) -> void
   end
   class APIError < TrackifiedError end
+  class QuotaExceededError < APIError end
+  class ConflictError < APIError end
   class ConnectionError < TrackifiedError end
-  class SignatureVerificationError < TrackifiedError end
+  class SignatureVerificationError < TrackifiedError
+    attr_reader reason: String?
+    def initialize: (?String? message, ?reason: String?, **untyped) -> void
+  end
 
   module TrackingStatus
     NOT_YET_SCANNED: String
@@ -101,6 +106,14 @@ module Trackified
     def mode: () -> String?
     def regions: () -> Array[String]?
     def tier: () -> Integer?
+    def aliases: () -> Array[String]?
+  end
+
+  class CarrierResolution < Model
+    def carrier: () -> String
+    def name: () -> String
+    def confidence: () -> Float
+    def matched: () -> ("id" | "alias" | "name" | "provider_slug" | "prefix")
   end
 
   class CarrierCandidate < Model
@@ -119,6 +132,8 @@ module Trackified
     def consecutive_failures: () -> Integer?
     def created_at: () -> String
     def disabled_at: () -> String?
+    def previous_secret_expires_at: () -> String?
+    def self.tracking_of: (Event event) -> Tracking
   end
 
   class WebhookDelivery < Model
@@ -162,6 +177,10 @@ module Trackified
     def type: () -> String
     def created_at: () -> String?
     def data: () -> json
+    def status_changed?: () -> bool
+    def tracking: () -> Tracking
+    def previous_status: () -> String?
+    def current_status: () -> String?
   end
 
   class Page[T] < Model
@@ -179,8 +198,20 @@ module Trackified
   module WebhookSignature
     DEFAULT_TOLERANCE: Integer
     HEADER: String
-    def self.verify: (String raw_body, String? header, String secret, ?tolerance: Integer, ?now: Integer) -> bool
-    def self.construct_event: (String raw_body, String? header, String secret, ?tolerance: Integer, ?now: Integer) -> Event
+    REASONS: Array[String]
+    type secrets = String | Array[String]
+    type reason = "missing" | "malformed" | "timestamp" | "mismatch"
+
+    class VerificationResult < Struct[untyped]
+      attr_accessor valid: bool
+      attr_accessor reason: reason?
+      def initialize: (valid: bool, reason: reason?) -> void
+      def valid?: () -> bool
+    end
+
+    def self.verify: (String raw_body, String? header, secrets? secret, ?tolerance: Integer, ?now: Integer) -> bool
+    def self.verify_detailed: (String raw_body, String? header, secrets? secret, ?tolerance: Integer, ?now: Integer) -> VerificationResult
+    def self.construct_event: (String raw_body, String? header, secrets? secret, ?tolerance: Integer, ?now: Integer) -> Event
   end
 
   class Client
@@ -197,7 +228,12 @@ module Trackified
     attr_reader webhook_deliveries: Resources::WebhookDeliveries
     attr_reader api_keys: Resources::ApiKeys
     attr_reader usage: Resources::Usage
-    def initialize: (?api_key: String?, ?base_url: String?, ?timeout: Numeric, ?max_retries: Integer) -> void
+    type request_info = { method: String, url: String, attempt: Integer, idempotency_key: String? }
+    type response_info = { method: String, url: String, attempt: Integer, status: Integer?, request_id: String?,
+                           idempotent_replayed: bool, duration_ms: Integer, error: TrackifiedError? }
+    def initialize: (?api_key: String?, ?base_url: String?, ?timeout: Numeric, ?max_retries: Integer,
+                     ?on_request: (^(request_info) -> void)?, ?on_response: (^(response_info) -> void)?) -> void
+    def health: () -> { "status" => String }
     def request: (Symbol method, String path, ?query: Hash[Symbol, untyped]?, ?body: untyped, ?idempotency_key: String?) -> untyped
   end
 
@@ -219,6 +255,7 @@ module Trackified
     class Carriers < Base
       def list: (?limit: Integer?, ?offset: Integer?) -> Page[Carrier]
       def get: (String id) -> Carrier
+      def resolve: (String name) -> CarrierResolution?
       def detect: (String tracking_number) -> Array[CarrierCandidate]
       def catalog: (?q: String?, ?support: String?, ?limit: Integer?) -> json
       def status: () -> json
@@ -228,9 +265,13 @@ module Trackified
       def create: (url: String, ?event_types: Array[String]?) -> Webhook
       def list: (?limit: Integer?, ?offset: Integer?) -> Page[Webhook]
       def delete: (String id) -> nil
+      def update: (String id, ?url: String?, ?event_types: Array[String]?, ?enabled: bool?) -> Webhook
+      def rotate_secret: (String id, ?expires_in_hours: Integer?) -> Webhook
       def test: (String id) -> json
-      def verify: (String raw_body, String? header, String secret, ?tolerance: Integer) -> bool
-      def construct_event: (String raw_body, String? header, String secret, ?tolerance: Integer) -> Event
+      def tracking_of: (Event event) -> Tracking
+      def verify: (String raw_body, String? header, WebhookSignature::secrets? secret, ?tolerance: Integer) -> bool
+      def verify_detailed: (String raw_body, String? header, WebhookSignature::secrets? secret, ?tolerance: Integer) -> WebhookSignature::VerificationResult
+      def construct_event: (String raw_body, String? header, WebhookSignature::secrets? secret, ?tolerance: Integer) -> Event
     end
 
     class WebhookDeliveries < Base

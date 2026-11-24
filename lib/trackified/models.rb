@@ -72,9 +72,15 @@ module Trackified
     def inspect = "#<#{self.class.name} #{@data.inspect}>"
   end
 
-  # One carrier scan, newest first.
+  # One carrier scan. Tracking#events is newest first (guaranteed by the API).
+  #
+  # occurred_at without an offset is the local time where the scan happened; when the carrier gives an
+  # offset it is included and time_zone_known is true.
   class TrackingEvent < Model
-    fields :occurred_at, :time_zone_known, :status, :description, :location, :date
+    fields :occurred_at, :time_zone_known, :status, :description, :location
+
+    # @deprecated Use occurred_at. Sent until 2027-06-01, removed after that.
+    def date = @data["date"]
   end
 
   # A tracked parcel.
@@ -82,14 +88,21 @@ module Trackified
     fields :id, :tracking_number, :carrier, :carrier_detected, :status, :estimated_delivery, :delivered_at,
            :delivered_at_time_zone_known, :delivery_detected_at, :exception, :service_level, :custom_id,
            :customer_email, :last_scraped_at, :next_scrape_at, :created_at, :updated_at
+    # Newest first: sorted by occurred_at desc (guaranteed by the API); undated events keep their carrier
+    # position after the dated ones.
     nested :events, TrackingEvent
   end
 
   # A carrier Trackified supports.
   class Carrier < Model
-    fields :id, :mode, :regions, :tier
+    fields :id, :mode, :regions, :tier, :aliases
     # The API returns displayName; the spec documents display_name. Accept both.
     def display_name = @data["display_name"] || @data["displayName"]
+  end
+
+  # Result of carriers.resolve. matched is "id", "alias", "name", "provider_slug" or "prefix".
+  class CarrierResolution < Model
+    fields :carrier, :name, :confidence, :matched
   end
 
   # A carrier guess from carriers.detect.
@@ -100,8 +113,13 @@ module Trackified
   # A webhook endpoint.
   class Webhook < Model
     # secret is only present in the create response.
+    # previous_secret_expires_at is only present in the rotate_secret response.
     fields :id, :url, :event_types, :enabled, :secret_preview, :secret, :consecutive_failures, :created_at,
-           :disabled_at
+           :disabled_at, :previous_secret_expires_at
+
+    # @param event [Event]
+    # @return [Tracking] the tracking of any event type
+    def self.tracking_of(event) = event.tracking
   end
 
   # One webhook delivery attempt record.
@@ -122,10 +140,27 @@ module Trackified
   end
 
   # A verified webhook event.
+  #
+  # data is {"tracking", "previous_status", "current_status"} for tracking.status_changed, and the tracking
+  # itself for every other type. Use #tracking for either shape.
   class Event < Model
     fields :id, :type, :created_at
-    # @return [Hash] the event payload (a tracking for tracking.* events)
+    # @return [Hash] the raw event payload
     def data = @data["data"]
+
+    # @return [Boolean]
+    def status_changed? = type == WebhookEventType::TRACKING_STATUS_CHANGED
+
+    # @return [Tracking] the tracking, whatever the event type
+    def tracking
+      d = data || {}
+      Tracking.new(status_changed? ? d["tracking"] : d)
+    end
+
+    # @return [String, nil] only for tracking.status_changed
+    def previous_status = status_changed? ? data&.dig("previous_status") : nil
+    # @return [String, nil] only for tracking.status_changed
+    def current_status = status_changed? ? data&.dig("current_status") : nil
   end
 
   # One page of a list endpoint. Enumerable over every item across all pages.

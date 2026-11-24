@@ -43,8 +43,24 @@ module Trackified
 
   # 5xx and any other unexpected status
   class APIError < TrackifiedError; end
-  # Network failure or timeout; status is nil.
+  # 402: the plan's tracking quota is used up (code "quota_exceeded").
+  # Subclasses APIError because 0.1 raised APIError for 402.
+  class QuotaExceededError < APIError; end
+  # 409, e.g. "idempotency_in_progress": a request with the same idempotency key is still running. Not retried.
+  # Subclasses APIError because 0.1 raised APIError for 409.
+  class ConflictError < APIError; end
+  # Network failure or timeout; status is nil. code is "timeout" or "connection".
+  # After a timeout the outcome is unknown: retry with the same idempotency key.
   class ConnectionError < TrackifiedError; end
+
   # Webhook signature did not verify.
-  class SignatureVerificationError < TrackifiedError; end
+  class SignatureVerificationError < TrackifiedError
+    # @return [String] "missing", "malformed", "timestamp" or "mismatch"
+    attr_reader :reason
+
+    def initialize(message = nil, reason: nil, **kwargs)
+      super(message, **kwargs)
+      @reason = reason
+    end
+  end
 end

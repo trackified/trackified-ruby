@@ -13,6 +13,8 @@ RSpec.describe "live API", live: true do
       expect(client.trackings.list(limit: 1).data.size).to be <= 1
       expect(client.carriers.detect("9434650110837017316201").first.carrier).to eq("usps")
       expect(client.usage.get.plan).to be_a(String)
+      expect(client.health).to eq("status" => "ok")
+      expect(client.carriers.resolve("USPS Priority Mail")&.carrier).to eq("usps")
     ensure
       client.trackings.delete(t.id)
     end
