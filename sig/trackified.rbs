@@ -1,0 +1,250 @@
+module Trackified
+  VERSION: String
+
+  class TrackifiedError < StandardError
+    attr_reader status: Integer?
+    attr_reader code: String?
+    attr_reader request_id: String?
+    attr_reader body: untyped
+    def initialize: (?String? message, ?status: Integer?, ?code: String?, ?request_id: String?, ?body: untyped) -> void
+  end
+  class AuthenticationError < TrackifiedError end
+  class PermissionError < TrackifiedError end
+  class NotFoundError < TrackifiedError end
+  class ValidationError < TrackifiedError end
+  class RateLimitError < TrackifiedError
+    attr_reader retry_after: Float?
+    def initialize: (?String? message, ?retry_after: Float?, **untyped) -> void
+  end
+  class APIError < TrackifiedError end
+  class ConnectionError < TrackifiedError end
+  class SignatureVerificationError < TrackifiedError end
+
+  module TrackingStatus
+    NOT_YET_SCANNED: String
+    IN_TRANSIT: String
+    OUT_FOR_DELIVERY: String
+    AVAILABLE_FOR_PICKUP: String
+    DELIVERED: String
+    EXCEPTION: String
+    RETURNED: String
+    UNKNOWN: String
+    ALL: Array[String]
+  end
+
+  module EventStatus
+    INFO_RECEIVED: String
+    IN_TRANSIT: String
+    OUT_FOR_DELIVERY: String
+    AVAILABLE_FOR_PICKUP: String
+    DELIVERED: String
+    EXCEPTION: String
+    RETURNED: String
+    UNKNOWN: String
+    ALL: Array[String]
+  end
+
+  module WebhookEventType
+    TRACKING_CREATED: String
+    TRACKING_UPDATED: String
+    TRACKING_STATUS_CHANGED: String
+    TRACKING_DELIVERED: String
+    TRACKING_EXCEPTION: String
+    TRACKING_RETURNED: String
+    TRACKING_EXPIRED: String
+    ALL: Array[String]
+  end
+
+  type json = Hash[String, untyped]
+
+  class Model
+    def self.fields: (*Symbol names) -> void
+    def self.nested: (Symbol name, Class klass) -> void
+    def initialize: (json? data) -> void
+    def []: (String | Symbol key) -> untyped
+    def to_h: () -> json
+  end
+
+  class TrackingEvent < Model
+    def occurred_at: () -> String?
+    def time_zone_known: () -> bool
+    def status: () -> String
+    def description: () -> String
+    def location: () -> String
+    def date: () -> String?
+  end
+
+  class Tracking < Model
+    def id: () -> String
+    def tracking_number: () -> String
+    def carrier: () -> String?
+    def carrier_detected: () -> bool
+    def status: () -> String
+    def events: () -> Array[TrackingEvent]
+    def estimated_delivery: () -> String?
+    def delivered_at: () -> String?
+    def delivered_at_time_zone_known: () -> bool
+    def delivery_detected_at: () -> String?
+    def exception: () -> String?
+    def service_level: () -> String?
+    def custom_id: () -> String?
+    def customer_email: () -> String?
+    def last_scraped_at: () -> String?
+    def next_scrape_at: () -> String?
+    def created_at: () -> String
+    def updated_at: () -> String
+  end
+
+  class Carrier < Model
+    def id: () -> String
+    def display_name: () -> String?
+    def mode: () -> String?
+    def regions: () -> Array[String]?
+    def tier: () -> Integer?
+  end
+
+  class CarrierCandidate < Model
+    def carrier: () -> String
+    def confidence: () -> Float
+    def reason: () -> String?
+  end
+
+  class Webhook < Model
+    def id: () -> String
+    def url: () -> String
+    def event_types: () -> Array[String]
+    def enabled: () -> bool
+    def secret_preview: () -> String?
+    def secret: () -> String?
+    def consecutive_failures: () -> Integer?
+    def created_at: () -> String
+    def disabled_at: () -> String?
+  end
+
+  class WebhookDelivery < Model
+    def id: () -> String
+    def webhook_id: () -> String
+    def url: () -> String
+    def event_type: () -> String
+    def status: () -> Integer?
+    def attempts: () -> Integer
+    def error: () -> String?
+    def delivered_at: () -> String?
+    def created_at: () -> String
+  end
+
+  class ApiKey < Model
+    def id: () -> String
+    def name: () -> String?
+    def prefix: () -> String
+    def mode: () -> String
+    def scopes: () -> Array[String]
+    def token: () -> String?
+    def created_at: () -> String
+    def last_used_at: () -> String?
+    def revoked_at: () -> String?
+  end
+
+  class Usage < Model
+    def period_start: () -> String
+    def period_end: () -> String
+    def plan: () -> String
+    def trackings_used: () -> Integer
+    def trackings_limit: () -> Integer
+    def trackings_remaining: () -> Integer
+    def rate_limit_per_minute: () -> Integer
+    def webhook_deliveries: () -> Integer
+    def carrier_volume: () -> Array[{ "carrier" => String, "count" => Integer }]
+  end
+
+  class Event < Model
+    def id: () -> String
+    def type: () -> String
+    def created_at: () -> String?
+    def data: () -> json
+  end
+
+  class Page[T] < Model
+    include Enumerable[T]
+    def initialize: (json? data, Class klass) ?{ (Integer offset) -> Page[T] } -> void
+    def data: () -> Array[T]
+    def pagination: () -> json
+    def next_page?: () -> bool
+    def next_page: () -> Page[T]?
+    def each: () { (T) -> void } -> void
+            | () -> Enumerator[T, void]
+    alias auto_paging_each each
+  end
+
+  module WebhookSignature
+    DEFAULT_TOLERANCE: Integer
+    HEADER: String
+    def self.verify: (String raw_body, String? header, String secret, ?tolerance: Integer, ?now: Integer) -> bool
+    def self.construct_event: (String raw_body, String? header, String secret, ?tolerance: Integer, ?now: Integer) -> Event
+  end
+
+  class Client
+    DEFAULT_BASE_URL: String
+    RETRYABLE_STATUSES: Array[Integer]
+    MAX_BACKOFF: Float
+    NETWORK_ERRORS: Array[Class]
+    attr_reader base_url: String
+    attr_reader timeout: Numeric
+    attr_reader max_retries: Integer
+    attr_reader trackings: Resources::Trackings
+    attr_reader carriers: Resources::Carriers
+    attr_reader webhooks: Resources::Webhooks
+    attr_reader webhook_deliveries: Resources::WebhookDeliveries
+    attr_reader api_keys: Resources::ApiKeys
+    attr_reader usage: Resources::Usage
+    def initialize: (?api_key: String?, ?base_url: String?, ?timeout: Numeric, ?max_retries: Integer) -> void
+    def request: (Symbol method, String path, ?query: Hash[Symbol, untyped]?, ?body: untyped, ?idempotency_key: String?) -> untyped
+  end
+
+  module Resources
+    class Base
+      def initialize: (Client client) -> void
+    end
+
+    class Trackings < Base
+      def create: (tracking_number: String, ?carrier: String?, ?custom_id: String?, ?customer_email: String?, ?idempotency_key: String?) -> Tracking
+      def list: (?limit: Integer?, ?offset: Integer?, ?status: String?, ?carrier: String?, ?custom_id: String?, ?tracking_number: String?) -> Page[Tracking]
+      def bulk_create: (Array[Hash[Symbol, String]] trackings, ?idempotency_key: String?) -> Array[json]
+      def get: (String id) -> Tracking
+      def update: (String id, ?carrier: String?, ?custom_id: String?, ?customer_email: String?) -> Tracking
+      def delete: (String id) -> json
+      def retrack: (String id) -> json
+    end
+
+    class Carriers < Base
+      def list: (?limit: Integer?, ?offset: Integer?) -> Page[Carrier]
+      def get: (String id) -> Carrier
+      def detect: (String tracking_number) -> Array[CarrierCandidate]
+      def catalog: (?q: String?, ?support: String?, ?limit: Integer?) -> json
+      def status: () -> json
+    end
+
+    class Webhooks < Base
+      def create: (url: String, ?event_types: Array[String]?) -> Webhook
+      def list: (?limit: Integer?, ?offset: Integer?) -> Page[Webhook]
+      def delete: (String id) -> nil
+      def test: (String id) -> json
+      def verify: (String raw_body, String? header, String secret, ?tolerance: Integer) -> bool
+      def construct_event: (String raw_body, String? header, String secret, ?tolerance: Integer) -> Event
+    end
+
+    class WebhookDeliveries < Base
+      def list: (?limit: Integer?, ?offset: Integer?) -> Page[WebhookDelivery]
+    end
+
+    class ApiKeys < Base
+      def create: (?name: String?, ?mode: String?, ?scopes: Array[String]?) -> ApiKey
+      def list: (?limit: Integer?, ?offset: Integer?) -> Page[ApiKey]
+      def revoke: (String id) -> nil
+    end
+
+    class Usage < Base
+      def get: () -> Trackified::Usage
+    end
+  end
+end

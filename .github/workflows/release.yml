@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # sign the attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ruby/setup-ruby@be3c7df29b3349ec6bcfc6b4792f1cf9f5237d18 # v1.343.0
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Check tag matches gem version
+        run: test "v$(ruby -Ilib -rtrackified/version -e 'print Trackified::VERSION')" = "$GITHUB_REF_NAME"
+      - run: bundle exec rspec
+      - name: Build gem (reproducible)
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          mkdir -p pkg && gem build trackified.gemspec -o "pkg/trackified-${GITHUB_REF_NAME#v}.gem"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: pkg/*.gem
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" pkg/*.gem --title "$GITHUB_REF_NAME" --notes "See [CHANGELOG.md](CHANGELOG.md)." --verify-tag
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: rubygems
+      url: https://rubygems.org/gems/trackified
+    permissions:
+      contents: write # release-gem's rake release may push the tag (already exists here)
+      id-token: write # RubyGems trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@be3c7df29b3349ec6bcfc6b4792f1cf9f5237d18 # v1.343.0
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: Pin gem build time to the commit (same bytes as the attested gem)
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - uses: rubygems/release-gem@2654a0fe0dc39725c07fe84d7fe863a084f2424e # v1.5.0
