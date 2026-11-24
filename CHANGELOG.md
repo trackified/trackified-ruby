@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- First published release (0.1.0 was tagged but never built).
+
 ## 0.1.0
 
 - First release: every Trackified API operation (trackings, carriers, webhooks, webhook deliveries, API keys,
